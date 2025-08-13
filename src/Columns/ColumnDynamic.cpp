@@ -299,7 +299,7 @@ void ColumnDynamic::get(size_t n, Field & res) const
         return;
     }
 
-    /// We should deeserialize value from shared variant.
+    /// We should deserialize value from shared variant.
     const auto & shared_variant = getSharedVariant();
     auto value_data = shared_variant.getDataAt(variant_col.offsetAt(n));
     ReadBufferFromMemory buf(value_data.data, value_data.size);

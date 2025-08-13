@@ -1,6 +1,7 @@
 #pragma once
 
 #include <map>
+#include <unordered_set>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnObject.h>
@@ -26,25 +27,20 @@ constexpr size_t MAX_JSON_MERGE_TOTAL_SIZE = 100_MiB;
 
 struct DeepMergeJSONAggregateData
 {
-    struct PathData
-    {
-        Field value;
-        // Track if this path was explicitly deleted
-        bool is_deleted = false;
-    };
-
     /// Use std::map to keep paths sorted for consistent output
     /// StringRef will point to Arena-allocated memory
-    std::map<StringRef, PathData> paths;
+    std::map<StringRef, Field> typed_paths;
+    std::map<StringRef, Field> dynamic_paths;
+    std::unordered_set<StringRef> removed_paths;
 
     /// Check if a path represents an object (has children)
     bool isObjectPath(const StringRef & path) const;
 
     /// Add or update a path
-    void addPath(const StringRef & path, const Field & value, Arena * arena);
+    void addTypedPath(const StringRef & path, const Field & value, Arena * arena);
 
-    /// Handle deletion of a path (returns true if deletion was processed)
-    bool handleDeletion(const StringRef & target_path, Arena * arena);
+    /// Handle deletion of a path
+    void handleDeletion(const StringRef & target_path, Arena * arena);
 
 private:
     void removeChildPaths(const StringRef & parent_path);
