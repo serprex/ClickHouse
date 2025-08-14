@@ -108,9 +108,6 @@ private:
 
     /// Process all paths from ColumnObject
     void processColumnObject(const ColumnObject & col_object, size_t row_num, DeepMergeJSONAggregateData & data, Arena * arena) const;
-
-    /// Helper to process a single path-value pair
-    void processPath(const StringRef & path, const Field & value, DeepMergeJSONAggregateData & aggregate_data, Arena * arena) const;
 };
 
 }

@@ -122,15 +122,6 @@ void AggregateFunctionDeepMergeJSON::add(AggregateDataPtr __restrict place, cons
     processColumnObject(col_object, row_num, aggregate_data, arena);
 }
 
-void AggregateFunctionDeepMergeJSON::processPath(
-    const StringRef & path, const Field & value, DeepMergeJSONAggregateData & aggregate_data, Arena * arena) const
-{
-    validatePathLength(path.size);
-
-    auto interned_path = internString(path, arena);
-    aggregate_data.addTypedPath(interned_path, value, arena);
-}
-
 void AggregateFunctionDeepMergeJSON::processColumnObject(
     const ColumnObject & col_object, size_t row_num, DeepMergeJSONAggregateData & aggregate_data, Arena * arena) const
 {
@@ -139,7 +130,9 @@ void AggregateFunctionDeepMergeJSON::processColumnObject(
     {
         Field value;
         column->get(row_num, value);
-        processPath(StringRef(path), value, aggregate_data, arena);
+        validatePathLength(path.size());
+        auto interned_path = internString(path, arena);
+        aggregate_data.addTypedPath(interned_path, value, arena);
     }
 
     /// Process dynamic paths
@@ -147,10 +140,6 @@ void AggregateFunctionDeepMergeJSON::processColumnObject(
     {
         if (!dynamic_column->isNullAt(row_num))
         {
-            Field value;
-            dynamic_column->get(row_num, value);
-            processPath(StringRef(path), value, aggregate_data, arena);
-
             auto interned_path = internString(path, arena);
             WriteBufferFromOwnString value_buf;
             getDynamicSerialization()->serializeBinary(dynamic_column, value_buf, getFormatSettings());
@@ -171,17 +160,10 @@ void AggregateFunctionDeepMergeJSON::processColumnObject(
         auto path = shared_data_paths->getDataAt(i);
         validatePathLength(path.size);
 
-        /// Deserialize value from shared data
+        auto interned_path = internString(path, arena);
         auto value_data = shared_data_values->getDataAt(i);
-        ReadBufferFromMemory buf(value_data.data, value_data.size);
-        auto type = decodeDataType(buf);
-
-        const auto column = type->createColumn();
-        type->getDefaultSerialization()->deserializeBinary(*column, buf, FormatSettings());
-
-        Field value;
-        column->get(0, value);
-        processPath(path, value, aggregate_data, arena);
+        auto interned_value = internString(value_data, arena);
+        aggregate_data.dynamic_paths[interned_path] = internString(interned_value, arena);
     }
 
     validatePathsCount(aggregate_data.typed_paths.size());
@@ -294,14 +276,43 @@ void AggregateFunctionDeepMergeJSON::insertResultInto(AggregateDataPtr __restric
 {
     const auto & aggregate_data = data(place);
     auto & col_object = assert_cast<ColumnObject &>(to);
-
     auto typed = col_object.getTypedPaths();
+    auto dynamic = col_object.getDynamicPaths();
+    auto & shared_data_offsets = col_object.getSharedDataOffsets();
+    const auto [shared_data_paths, shared_data_values] = col_object.getSharedDataPathsAndValues();
+    size_t col_current_size = col_object.size();
+
     for (const auto & [path, field] : aggregate_data.typed_paths)
     {
-        col_object.insert(field);
+        // col_object.insert(path, field);
+        if (auto typed_it = typed.find(path); typed_it != typed.end())
+        {
+            typed_it->second->insert(field);
+        }
+        else if (auto dynamic_it = dynamic.find(path); dynamic_it != dynamic.end())
+        {
+            dynamic_it->second->insert(field);
+        }
+        else if (auto * dynamic_path_column = col_object.tryToAddNewDynamicPath(std::string_view(path)))
+        {
+            dynamic_path_column->insert(field);
+        }
+        /// We reached the limit on dynamic paths. Add this path to the common data if the value is not Null.
+        /// (we cannot distinguish cases when path has Null value or is absent in the row and consider them equivalent).
+        /// Object is actually std::map, so all paths are already sorted and we can add it right now.
+        else if (!field.isNull())
+        {
+            shared_data_paths->insertData(path.data, path.size);
+            auto & shared_data_values_chars = shared_data_values->getChars();
+            {
+                WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
+                getDynamicSerialization()->serializeBinary(field, value_buf, getFormatSettings());
+            }
+            shared_data_values_chars.push_back(0);
+            shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
+        }
     }
 
-    auto dynamic = col_object.getDynamicPaths();
     for (const auto & [path, value] : aggregate_data.dynamic_paths)
     {
         /// Check if we have this path in dynamic paths.
@@ -320,10 +331,30 @@ void AggregateFunctionDeepMergeJSON::insertResultInto(AggregateDataPtr __restric
         /// Serialized paths are sorted, so we can insert right away.
         else
         {
-            const auto [shared_data_paths, shared_data_values] = col_object.getSharedDataPathsAndValues();
             shared_data_paths->insertData(path.data, path.size);
-            shared_data_values->insertData(value.data, value.size);
+            //shared_data_values->insertData(value.data, value.size);
+            auto & shared_data_values_chars = shared_data_values->getChars();
+            {
+                WriteBufferFromVector<ColumnString::Chars> value_buf(shared_data_values_chars, AppendModeTag());
+                value_buf.write(value.data, value.size);
+            }
+            shared_data_values_chars.push_back(0);
+            shared_data_values->getOffsets().push_back(shared_data_values_chars.size());
         }
+    }
+
+    shared_data_offsets.push_back(shared_data_paths->size());
+    /// Fill all remaining typed and dynamic paths with default values.
+    for (auto & [_, column] : typed)
+    {
+        if (column->size() == col_current_size)
+            column->insertDefault();
+    }
+
+    for (auto & [_, column] : dynamic)
+    {
+        if (column->size() == col_current_size)
+            column->insertDefault();
     }
 }
 
