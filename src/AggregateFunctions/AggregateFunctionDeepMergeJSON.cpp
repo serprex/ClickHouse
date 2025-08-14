@@ -22,10 +22,12 @@ extern const int TOO_LARGE_STRING_SIZE;
 namespace
 {
 
+/*
 SerializationPtr getVariantSerialization(const DataTypePtr & variant_type)
 {
     return variant_type->getDefaultSerialization();
 }
+*/
 
 const FormatSettings & getFormatSettings()
 {
@@ -33,13 +35,11 @@ const FormatSettings & getFormatSettings()
     return settings;
 }
 
-/*
 const std::shared_ptr<SerializationDynamic> & getDynamicSerialization()
 {
     static const std::shared_ptr<SerializationDynamic> dynamic_serialization = std::make_shared<SerializationDynamic>();
     return dynamic_serialization;
 }
-*/
 
 /// Helper to validate path length
 void validatePathLength(size_t path_size)
@@ -78,15 +78,6 @@ bool DeepMergeJSONAggregateData::isObjectPath(const StringRef & path) const
         return it->first.size > path.size && memcmp(it->first.data, path.data, path.size) == 0 && it->first.data[path.size] == '.';
     }
     return false;
-}
-
-void DeepMergeJSONAggregateData::handleDeletion(const StringRef & target_path, Arena *)
-{
-    typed_paths.erase(target_path);
-    dynamic_paths.erase(target_path);
-    removed_paths.insert(target_path);
-
-    removeChildPaths(target_path);
 }
 
 void DeepMergeJSONAggregateData::addTypedPath(const StringRef & path, const Field & value, Arena *)
@@ -136,18 +127,6 @@ void AggregateFunctionDeepMergeJSON::processPath(
 {
     validatePathLength(path.size);
 
-    /// Check for deletion suffix if deletion key is configured
-    if (deletion_key.has_value())
-    {
-        std::string path_str = path.toString();
-        if (path_str.ends_with(std::string(".") + *deletion_key) && value.getType() == Field::Types::Bool && value.safeGet<bool>())
-        {
-            std::string target_path = path_str.substr(0, path_str.size() - (*deletion_key).size() - 1);
-            aggregate_data.handleDeletion(StringRef(target_path), arena);
-            return;
-        }
-    }
-
     auto interned_path = internString(path, arena);
     aggregate_data.addTypedPath(interned_path, value, arena);
 }
@@ -171,6 +150,13 @@ void AggregateFunctionDeepMergeJSON::processColumnObject(
             Field value;
             dynamic_column->get(row_num, value);
             processPath(StringRef(path), value, aggregate_data, arena);
+
+            auto interned_path = internString(path, arena);
+            WriteBufferFromOwnString value_buf;
+            getDynamicSerialization()->serializeBinary(dynamic_column, value_buf, getFormatSettings());
+            auto value_view = value_buf.stringView();
+            StringRef value_ref(value_view);
+            aggregate_data.dynamic_paths[interned_path] = internString(value_ref, arena);
         }
     }
 
@@ -206,8 +192,6 @@ void AggregateFunctionDeepMergeJSON::merge(AggregateDataPtr __restrict place, Co
 {
     auto & aggregate_data = data(place);
     const auto & rhs_data = data(rhs);
-
-    aggregate_data.removed_paths.insert(rhs_data.removed_paths.begin(), rhs_data.removed_paths.end());
 
     /// Merge paths from rhs, treating them as latest values
     for (const auto & [path, path_data] : rhs_data.typed_paths)
@@ -247,24 +231,9 @@ void AggregateFunctionDeepMergeJSON::serialize(
     for (const auto & [path, path_data] : aggregate_data.dynamic_paths)
     {
         writeStringBinary(path, buf);
+        writeStringBinary(path_data, buf);
 
-        /// Serialize Field
-        WriteBufferFromOwnString field_buf;
-        auto field_data_type = applyVisitor(FieldToDataType(), path_data);
-        encodeDataType(field_data_type, field_buf);
-        getVariantSerialization(field_data_type)->serializeBinary(path_data, field_buf, getFormatSettings());
-
-        total_size += path.size + field_buf.str().size();
-        validateTotalSize(total_size);
-    }
-
-    writeVarUInt(aggregate_data.removed_paths.size(), buf);
-
-    for (const auto & path : aggregate_data.removed_paths)
-    {
-        writeStringBinary(path, buf);
-
-        total_size += path.size;
+        total_size += path.size + path_data.size;
         validateTotalSize(total_size);
     }
 }
@@ -275,7 +244,6 @@ void AggregateFunctionDeepMergeJSON::deserialize(
     auto & aggregate_data = data(place);
     aggregate_data.typed_paths.clear();
     aggregate_data.dynamic_paths.clear();
-    aggregate_data.removed_paths.clear();
 
     size_t total_size = 0;
     size_t num_paths;
@@ -310,61 +278,51 @@ void AggregateFunctionDeepMergeJSON::deserialize(
         readStringBinary(path_str, buf);
         validatePathLength(path_str.size());
 
-        auto field_data_type = decodeDataType(buf);
-        auto tmp_column = field_data_type->createColumn();
-        tmp_column->reserve(1);
-        getVariantSerialization(field_data_type)->deserializeBinary(*tmp_column, buf, getFormatSettings());
+        String value_str;
+        readStringBinary(value_str, buf);
 
-        total_size += path_str.size();
+        total_size += path_str.size() + value_str.size();
         validateTotalSize(total_size);
 
         auto interned_path = internString(path_str, arena);
-        aggregate_data.dynamic_paths[interned_path] = (*tmp_column)[0];
-    }
-
-    readVarUInt(num_paths, buf);
-    validatePathsCount(num_paths);
-    for (size_t i = 0; i < num_paths; ++i)
-    {
-        String path_str;
-        readStringBinary(path_str, buf);
-        validatePathLength(path_str.size());
-
-        total_size += path_str.size();
-        validateTotalSize(total_size);
-
-        auto interned_path = internString(path_str, arena);
-        aggregate_data.removed_paths.insert(interned_path);
+        auto interned_value = internString(value_str, arena);
+        aggregate_data.dynamic_paths[interned_path] = interned_value;
     }
 }
 
 void AggregateFunctionDeepMergeJSON::insertResultInto(AggregateDataPtr __restrict place, IColumn & to, [[maybe_unused]] Arena * arena) const
 {
-    // TODO handle removed columns
     const auto & aggregate_data = data(place);
     auto & col_object = assert_cast<ColumnObject &>(to);
 
     auto typed = col_object.getTypedPaths();
     for (const auto & [path, field] : aggregate_data.typed_paths)
     {
-        if (auto it = typed.find(path.toString()); it != typed.end()) {
-            it->second->insert(field);
-        } else {
-            // ??
-        }
+        col_object.insert(field);
     }
 
     auto dynamic = col_object.getDynamicPaths();
     for (const auto & [path, value] : aggregate_data.dynamic_paths)
     {
-        if (auto it = dynamic.find(path.toString()); it != dynamic.end()) {
-            it->second->insert(value);
-        } else {
-            // TODO what is max
-            auto new_dynamic_column = ColumnDynamic::create(1024);
-            new_dynamic_column->reserve(1);
-            new_dynamic_column->insert(value);
-            dynamic.emplace(path, std::move(new_dynamic_column));
+        /// Check if we have this path in dynamic paths.
+        if (auto dynamic_it = dynamic.find(path); dynamic_it != dynamic.end())
+        {
+            ReadBufferFromMemory buf(value.data, value.size);
+            getDynamicSerialization()->deserializeBinary(*dynamic_it->second, buf, getFormatSettings());
+        }
+        /// Try to add a new dynamic path.
+        else if (auto * dynamic_path_column = col_object.tryToAddNewDynamicPath(std::string_view(path)))
+        {
+            ReadBufferFromMemory buf(value.data, value.size);
+            getDynamicSerialization()->deserializeBinary(*dynamic_path_column, buf, getFormatSettings());
+        }
+        /// Limit on dynamic paths is reached, add this path to shared data.
+        /// Serialized paths are sorted, so we can insert right away.
+        else
+        {
+            const auto [shared_data_paths, shared_data_values] = col_object.getSharedDataPathsAndValues();
+            shared_data_paths->insertData(path.data, path.size);
+            shared_data_values->insertData(value.data, value.size);
         }
     }
 }

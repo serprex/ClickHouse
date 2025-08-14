@@ -1,7 +1,6 @@
 #pragma once
 
 #include <map>
-#include <unordered_set>
 #include <AggregateFunctions/AggregateFunctionFactory.h>
 #include <AggregateFunctions/IAggregateFunction.h>
 #include <Columns/ColumnObject.h>
@@ -30,17 +29,13 @@ struct DeepMergeJSONAggregateData
     /// Use std::map to keep paths sorted for consistent output
     /// StringRef will point to Arena-allocated memory
     std::map<StringRef, Field> typed_paths;
-    std::map<StringRef, Field> dynamic_paths;
-    std::unordered_set<StringRef> removed_paths;
+    std::map<StringRef, StringRef> dynamic_paths;
 
     /// Check if a path represents an object (has children)
     bool isObjectPath(const StringRef & path) const;
 
     /// Add or update a path
     void addTypedPath(const StringRef & path, const Field & value, Arena * arena);
-
-    /// Handle deletion of a path
-    void handleDeletion(const StringRef & target_path, Arena * arena);
 
 private:
     void removeChildPaths(const StringRef & parent_path);
