@@ -182,6 +182,13 @@ void AggregateFunctionDeepMergeJSON::merge(AggregateDataPtr __restrict place, Co
         aggregate_data.addTypedPath(interned_path, path_data, arena);
     }
 
+    for (const auto & [path, value] : rhs_data.dynamic_paths)
+    {
+        auto interned_path = internString(path, arena);
+        auto interned_value = internString(value, arena);
+        aggregate_data.dynamic_paths[interned_path] = interned_value;
+    }
+
     validatePathsCount(aggregate_data.typed_paths.size());
     validatePathsCount(aggregate_data.dynamic_paths.size());
 }
@@ -284,7 +291,6 @@ void AggregateFunctionDeepMergeJSON::insertResultInto(AggregateDataPtr __restric
 
     for (const auto & [path, field] : aggregate_data.typed_paths)
     {
-        // col_object.insert(path, field);
         if (auto typed_it = typed.find(path); typed_it != typed.end())
         {
             typed_it->second->insert(field);
