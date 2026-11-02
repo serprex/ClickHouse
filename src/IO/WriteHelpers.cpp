@@ -90,19 +90,14 @@ void writeException(const Exception & e, WriteBuffer & buf, bool with_stack_trac
 }
 
 
-/// The same, but quotes apply only if there are characters that do not match the identifier without quotes
-template <typename F>
-static inline void writeProbablyQuotedStringImpl(std::string_view s, WriteBuffer & buf, F && write_quoted_string)
+namespace
 {
-    /// These are valid identifiers but are problematic if present unquoted in SQL query
-    /// because they are keywords that the parser interprets as clause starters or modifiers,
-    /// causing the formatted AST to fail parsing back.
-    auto isCaseInsensitiveEqual = [](std::string_view a, std::string_view b)
-    {
-        return a.size() == b.size()
-            && 0 == strncasecmp(a.data(), b.data(), a.size()); // NOLINT(bugprone-suspicious-stringview-data-usage)
-    };
 
+/// These are valid identifiers but are problematic if present unquoted in SQL query
+/// because they are keywords that the parser interprets as clause starters or modifiers,
+/// causing the formatted AST to fail parsing back.
+constexpr std::array<std::string_view, 16> quoted_keywords
+{
     /// These are valid identifiers that the parser reads back as a literal instead of an identifier:
     /// `ParserNumber` hands a bare word to `strtod`, which accepts `inf`, `infinity` and `nan`, and
     /// `true`/`false` are parsed as `Bool` literals. (`null` is already rejected by
@@ -110,42 +105,148 @@ static inline void writeProbablyQuotedStringImpl(std::string_view s, WriteBuffer
     /// into a constant: a table with a column named `inf` has `ORDER BY inf` written to its
     /// metadata, and the next server start fails to load it with `Sorting key cannot contain
     /// constants`.
-    auto isParsedAsLiteral = [&](std::string_view identifier)
-    {
-        return isCaseInsensitiveEqual(identifier, "inf")
-            || isCaseInsensitiveEqual(identifier, "infinity")
-            || isCaseInsensitiveEqual(identifier, "nan")
-            || isCaseInsensitiveEqual(identifier, "true")
-            || isCaseInsensitiveEqual(identifier, "false");
-    };
+    "inf", "infinity", "nan", "true", "false",
+    "distinct", "all",
+    /// The parser can consume a bare `SOME` as the array-quantifier keyword, which rewrites the
+    /// node at parse time, so a function of that name has to stay quoted to survive a re-parse.
+    "some",
+    "table",
+    /// SELECT unquoted as an identifier would be re-parsed as the SELECT keyword and produce a
+    /// different AST, e.g. arrayElement(Identifier("SELECT"), x) formats as SELECT[x], which
+    /// re-parses as a subquery (SELECT [x]) with a different structure.
+    "select",
+    /// CUBE and ROLLUP are parsed as GROUP BY modifiers when left unquoted, so identifiers
+    /// with these names must stay quoted to survive formatting and re-parsing.
+    "cube", "rollup",
+    /// RECURSIVE is parsed as the WITH RECURSIVE keyword when left unquoted, so a CTE named
+    /// `recursive` must stay quoted to survive formatting and re-parsing.
+    "recursive",
+    /// These keywords cause parsing ambiguity when used as function or identifier names
+    /// because the parser consumes them as clause-starting keywords.
+    "from", "top", "values",
+};
 
-    if (isValidIdentifier(s)
-        && !isParsedAsLiteral(s)
-        && !isCaseInsensitiveEqual(s, "distinct")
-        && !isCaseInsensitiveEqual(s, "all")
-        /// The parser can consume a bare `SOME` as the array-quantifier keyword, which rewrites the
-        /// node at parse time, so a function of that name has to stay quoted to survive a re-parse.
-        && !isCaseInsensitiveEqual(s, "some")
-        && !isCaseInsensitiveEqual(s, "table")
-        /// SELECT unquoted as an identifier would be re-parsed as the SELECT keyword and produce a
-        /// different AST, e.g. arrayElement(Identifier("SELECT"), x) formats as SELECT[x], which
-        /// re-parses as a subquery (SELECT [x]) with a different structure.
-        && !isCaseInsensitiveEqual(s, "select")
-        /// CUBE and ROLLUP are parsed as GROUP BY modifiers when left unquoted, so identifiers
-        /// with these names must stay quoted to survive formatting and re-parsing.
-        && !isCaseInsensitiveEqual(s, "cube")
-        && !isCaseInsensitiveEqual(s, "rollup")
-        /// RECURSIVE is parsed as the WITH RECURSIVE keyword when left unquoted, so a CTE named
-        /// `recursive` must stay quoted to survive formatting and re-parsing.
-        && !isCaseInsensitiveEqual(s, "recursive")
-        /// These keywords cause parsing ambiguity when used as function or identifier names
-        /// because the parser consumes them as clause-starting keywords.
-        && !isCaseInsensitiveEqual(s, "from")
-        && !isCaseInsensitiveEqual(s, "top")
-        && !isCaseInsensitiveEqual(s, "values"))
+/// Exact ASCII case-insensitive membership in trie of lower case letters.
+/// First letter `c` enters state `c - 'a'`. Edges are laid out breadth first and edge `i` enters
+/// state `i + 26`, so no target table is needed. Upper case label marks edge that ends a keyword
+template <size_t edges>
+struct KeywordTrie
+{
+    std::array<UInt8, 26 + edges + 1> first{};
+    std::array<char, edges> labels{};
+
+    constexpr bool contains(std::string_view s) const
     {
-        writeString(s, buf);
+        if (s.empty())
+            return false;
+        /// `| 32` folds ASCII letters onto `a`..`z` and moves every other byte outside that range
+        size_t state = (static_cast<UInt8>(s[0]) | 32U) - 'a';
+        if (state >= 26)
+            return false;
+        for (char c : s.substr(1))
+        {
+            const unsigned folded = static_cast<UInt8>(c) | 32U;
+            size_t edge = first[state];
+            do
+            {
+                if (edge == first[state + 1])
+                    return false;
+            } while ((static_cast<UInt8>(labels[edge++]) | 32U) != folded);
+            state = edge + 25;
+        }
+        return state >= 26 && !(labels[state - 26] & 32);
     }
+};
+
+/// First letter state cannot carry end of keyword mark, so single letters are unsupported
+static_assert(std::ranges::all_of(quoted_keywords, [](std::string_view word)
+{
+    return word.size() >= 2 && std::ranges::all_of(word, [](char c) { return c >= 'a' && c <= 'z'; });
+}), "Keywords must be at least two lower case ASCII letters");
+
+/// Pointer based trie, node 0 is root
+struct KeywordTrieScratch
+{
+    static constexpr size_t max_nodes = []
+    {
+        size_t res = 1;
+        for (std::string_view word : quoted_keywords)
+            res += word.size();
+        return res;
+    }();
+
+    std::array<std::array<size_t, 26>, max_nodes> child{};
+    std::array<bool, max_nodes> terminal{};
+    size_t nodes = 1;
+    bool has_duplicate = false;
+};
+
+constexpr KeywordTrieScratch quoted_keywords_scratch = []
+{
+    KeywordTrieScratch res;
+    for (std::string_view word : quoted_keywords)
+    {
+        size_t node = 0;
+        for (char c : word)
+        {
+            auto & child = res.child[node][c - 'a'];
+            if (!child)
+                child = res.nodes++;
+            node = child;
+        }
+        if (res.terminal[node])
+            res.has_duplicate = true;
+        res.terminal[node] = true;
+    }
+    return res;
+}();
+
+static_assert(!quoted_keywords_scratch.has_duplicate, "Keywords must be unique");
+
+/// Every node except root and first letters is entered by its own edge
+constexpr size_t quoted_keywords_edges = quoted_keywords_scratch.nodes - 1
+    - static_cast<size_t>(std::ranges::count_if(quoted_keywords_scratch.child[0], [](size_t child) { return child != 0; }));
+
+static_assert(quoted_keywords_edges < 256, "Edge indices must fit in UInt8");
+
+constexpr auto quoted_keywords_trie = []
+{
+    const auto & scratch = quoted_keywords_scratch;
+    KeywordTrie<quoted_keywords_edges> res;
+    /// Scratch node of each state in breadth first order, 0 for first letters without keywords
+    std::array<size_t, 26 + quoted_keywords_edges> node_of_state{};
+    std::copy_n(scratch.child[0].begin(), 26, node_of_state.begin());
+    size_t edge = 0;
+    for (size_t state = 0; state < 26 + edge; ++state)
+    {
+        res.first[state] = static_cast<UInt8>(edge);
+        const size_t node = node_of_state[state];
+        for (size_t c = 0; node && c < 26; ++c)
+        {
+            if (const size_t child = scratch.child[node][c])
+            {
+                res.labels[edge] = static_cast<char>((scratch.terminal[child] ? 'A' : 'a') + c);
+                node_of_state[26 + edge] = child;
+                ++edge;
+            }
+        }
+    }
+    res.first[26 + edge] = static_cast<UInt8>(edge);
+    return res;
+}();
+
+static_assert(quoted_keywords_trie.contains("inf") && quoted_keywords_trie.contains("InFiNiTy"));
+static_assert(!quoted_keywords_trie.contains("") && !quoted_keywords_trie.contains("in") && !quoted_keywords_trie.contains("infinit"));
+static_assert(!quoted_keywords_trie.contains("infinityx") && !quoted_keywords_trie.contains(std::string_view("inf\0", 4)));
+
+}
+
+/// The same, but quotes apply only if there are characters that do not match the identifier without quotes
+template <typename F>
+static inline void writeProbablyQuotedStringImpl(std::string_view s, WriteBuffer & buf, F && write_quoted_string)
+{
+    if (isValidIdentifier(s) && !quoted_keywords_trie.contains(s))
+        writeString(s, buf);
     else
         write_quoted_string(s, buf);
 }
